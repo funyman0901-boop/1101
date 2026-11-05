@@ -22,7 +22,7 @@ from win32com.shell import shell, shellcon
 
 import kompas_dimensions as core
 
-APP_NAME = "Габариты деталей 1.2 — обработка папки — КОМПАС-3D v24"
+APP_NAME = "Габариты деталей 1.3 — обработка исполнений — КОМПАС-3D v24"
 DATA = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "KompasDimensions"
 SCHEMA = DATA / "properties"
 UPDATE = C.WM_APP + 1
@@ -98,7 +98,7 @@ class Window:
                              302, C.WS_BORDER | C.ES_MULTILINE | C.ES_READONLY |
                              C.WS_VSCROLL | C.ES_AUTOVSCROLL)
         G.SendMessage(self.log, C.EM_SETLIMITTEXT, 2000000, 0)
-        self.add("STATIC", "Перед записью создаются резервные копии. Сборки .a3d не обрабатываются.",
+        self.add("STATIC", "Все исполнения измеряются отдельно. Перед записью создаются резервные копии.",
                  20, 660, 750, 23)
         G.ShowWindow(self.hwnd, C.SW_SHOW)
         G.UpdateWindow(self.hwnd)
@@ -234,6 +234,7 @@ class Window:
 
 def self_test(folder):
     from openpyxl import load_workbook
+    import embodiment_processing  # проверяет наличие модуля исполнений в .exe
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     prepare_cache()

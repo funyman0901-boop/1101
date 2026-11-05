@@ -1,14 +1,14 @@
 {
-  "version": "1.2",
+  "version": "1.3",
   "platform": "Windows x64",
-  "input": "Folder with recursive .m3d scan",
+  "input": "Folder with recursive .m3d scan and per-embodiment dimensions",
   "target": "КОМПАС-3D v24",
   "build": "Python 3.11.9 / PyInstaller 6.16.0 / Wine",
   "verification": {
-    "logic_tests": 19,
+    "logic_tests": 32,
     "frozen_excel_export": true,
     "frozen_gui_launch": true,
     "kompas_integration_tested": false
   },
-  "exe_sha256": "dcdceb27f25d96c3b45e2d53586b45e31c46049f7b72e6eff8bb9ae407febc43"
+  "exe_sha256": "a35c1cc8be624df4b6343d0c8ecb946271563a28d275104fefef7b10770f898f"
 }

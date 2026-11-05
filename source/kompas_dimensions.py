@@ -90,13 +90,13 @@ class Kompas:
             raise RuntimeError(f"Не прочитано свойство {prop.Name}: {result!r}")
         return result[1]
 
-    def category(self, doc, part):
+    def category(self, doc, part, source=None):
         if bool(part.Standard):
             return "standard", "IPart7.Standard"
         p = self.prop(doc, 20.0)
         if not p:
             return "normal", "Не задан"
-        keeper = self.api.IPropertyKeeper(part)
+        keeper = self.api.IPropertyKeeper(source if source is not None else part)
         if keeper.IsComplexPropertyValue(p):
             result = keeper.GetComplexPropertyValue(p, False)
             if not isinstance(result, tuple) or len(result) != 2:
@@ -157,6 +157,10 @@ class Kompas:
             vals.append(var.Value)
         return dimensions(vals)
 
+    def rebuild(self, doc):
+        if not self.api.IKompasDocument3D(doc).RebuildDocument():
+            raise RuntimeError("Не удалось перестроить геометрию исполнения")
+
     def opened(self):
         docs = self.app.Documents
         return {key(d.PathName): d for d in
@@ -213,7 +217,7 @@ def init_properties(k, folder):
     print(f"Созданы {seed} и {registry}. Храните их вместе и используйте во всех сборках.")
 
 
-def write_values(k, doc, part, prototypes, values):
+def write_values(k, doc, part, prototypes, values, storage=None):
     # Проверяем весь набор до первого изменения.
     existing = k.props(doc)
     selected = []
@@ -226,7 +230,8 @@ def write_values(k, doc, part, prototypes, values):
         if p and (p.Name != name or p.DataType != 2 or p.ReadOnly or p.IsVariable):
             raise RuntimeError(f"Конфликт определения/формула/защита свойства {name}")
         selected.append(p)
-    keeper = k.api.IPropertyKeeper(part)
+    source = storage if storage is not None else part
+    keeper = k.api.IPropertyKeeper(source)
     for name, p, value in zip(NAMES, selected, values):
         if not p:
             p = k.api.IProperty(k.mng.AddProperty(doc, prototypes[name]))
@@ -234,10 +239,10 @@ def write_values(k, doc, part, prototypes, values):
             raise RuntimeError(f"КОМПАС изменил ID при копировании {name}")
         if not keeper.SetPropertyValue(p, float(value), False):
             raise RuntimeError(f"Не записано свойство {name}")
-        if not math.isclose(float(k.read(part, p)), value, abs_tol=1e-8):
+        if not math.isclose(float(k.read(source, p)), value, abs_tol=1e-8):
             raise RuntimeError(f"Контроль чтения {name} не пройден")
-    if not part.Update():
-        raise RuntimeError("Не обновлены свойства верхнего компонента")
+    # IPart7.Update() не требуется для SetPropertyValue и может вернуть False
+    # у верхнего компонента. Результат проверяется чтением и после Save.
 
 
 def collect(k, root, log):
@@ -287,13 +292,13 @@ def export(folder, rows, log, counts):
     ws = wb.active
     ws.title = "Габариты"
     ws.append(["Файл", "Обозначение", "Наименование", "Количество", "Длина, мм",
-               "Ширина, мм", "Высота, мм", "Метод", "Запись свойств"])
+               "Ширина, мм", "Высота, мм", "Метод", "Запись свойств", "Исполнение"])
     for row in rows:
         ws.append(row)
     journal = wb.create_sheet("Журнал")
-    journal.append(["Вставка", "Файл", "Раздел", "Статус", "Причина"])
+    journal.append(["Вставка / путь", "Файл", "Раздел", "Статус", "Причина", "Исполнение"])
     for r in log:
-        journal.append([r.get(n, "") for n in ("trace", "path", "section", "status", "reason")])
+        journal.append([r.get(n, "") for n in ("trace", "path", "section", "status", "reason", "embodiment")])
     summary = wb.create_sheet("Итоги")
     summary.append(["Показатель", "Значение"])
     for name, value in counts.items():
@@ -404,6 +409,20 @@ def run(k, args):
                 doc = already or k.open(path, not args.write)
                 owned = already is None
                 part = k.top(doc)
+                count = int(k.api.IEmbodimentsManager(part).EmbodimentCount)
+                if count > 1:
+                    if not owned:
+                        raise RuntimeError("Закройте отдельное окно детали с исполнениями перед обработкой")
+                    from embodiment_processing import process
+                    processing_doc, doc = doc, None
+                    extra_rows, extra_log, processed = process(k, processing_doc, path, args, prototypes,
+                        folder / "backups" / f"{index:06d}" / path.name, pending[0].get("trace", ""))
+                    rows.extend(extra_rows)
+                    log.extend(extra_log)
+                    for r in pending:
+                        r.update(status="file_processed" if processed else "file_skipped",
+                                 reason="Результаты см. в строках исполнений")
+                    continue
                 cat, section = k.category(doc, part)
                 for r in pending:
                     r["section"] = section or "Не задан"
@@ -416,9 +435,6 @@ def run(k, args):
                     continue
                 if args.write and doc.ReadOnly:
                     raise RuntimeError("Файл открыт только для чтения")
-                count = k.api.IEmbodimentsManager(part).EmbodimentCount
-                if count > 1:
-                    raise RuntimeError("Файл содержит несколько исполнений; требуется отдельная обработка исполнений")
                 values = k.measure(part, args.mode)
                 marking = str(part.Marking or "")
                 name = str(part.Name or "")
@@ -439,7 +455,7 @@ def run(k, args):
                         if not p or not math.isclose(float(k.read(reread, p)), value, abs_tol=1e-8):
                             raise RuntimeError(f"Проверка после сохранения не пройдена: {n}; копия: {backup}")
                     saved = "сохранены и проверены"
-                rows.append([str(path), marking, name, len(pending), *values, args.mode, saved])
+                rows.append([str(path), marking, name, len(pending), *values, args.mode, saved, "Основное"])
                 for r in pending:
                     r.update(status="processed", reason=saved)
             except Exception as exc:
@@ -454,14 +470,16 @@ def run(k, args):
                         log.append({"path": str(path), "status": "close_error", "reason": str(exc)})
         tally = Counter(r["status"] for r in log)
         counts = {
-            "Обработано уникальных файлов": len(rows),
-            "Обработано файлов" if input_folder else "Обработано вставок": tally["processed"],
+            "Обработано уникальных файлов": len({key(row[0]) for row in rows}),
+            "Обработано исполнений / отдельных деталей": len(rows),
             "Пропущено стандартных изделий": tally["standard"],
             "Пропущено прочих изделий": tally["other"],
             "Ошибок обработки": tally["error"],
             "Конфликтов категорий (вставок)": tally["conflict"],
             "Без отдельного файла .m3d (вставок)": tally["unsupported"],
             "Ошибок закрытия": tally["close_error"],
+            "Ошибок восстановления исполнения": tally["restore_error"],
+            "Ошибок файлов с исполнениями": tally["file_error"],
             "Ошибок чтения папок": tally["scan_error"],
             "Источник": str(input_folder or root.PathName),
             "Метод": args.mode,
@@ -469,7 +487,7 @@ def run(k, args):
         export(folder, rows, log, counts)
         print(json.dumps(counts, ensure_ascii=False, indent=2))
         print(f"Результаты: {folder}")
-        return 2 if not groups or any(tally[s] for s in ("error", "conflict", "unsupported", "close_error", "scan_error")) else 0
+        return 2 if not groups or any(tally[s] for s in ("error", "conflict", "unsupported", "close_error", "scan_error", "restore_error", "file_error")) else 0
     finally:
         # JSON сохраняется даже при сбое экспорта Excel.
         (folder / "processing.json").write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
