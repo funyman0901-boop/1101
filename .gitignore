@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+*.spec
+dimension_properties/
+dimension_reports/

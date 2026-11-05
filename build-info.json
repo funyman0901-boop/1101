@@ -1,0 +1,13 @@
+{
+  "version": "1.0",
+  "platform": "Windows x64",
+  "target": "КОМПАС-3D v24",
+  "build": "Python 3.11.9 / PyInstaller 6.16.0 / Wine",
+  "verification": {
+    "logic_tests": 7,
+    "frozen_excel_export": true,
+    "frozen_gui_launch": true,
+    "kompas_integration_tested": false
+  },
+  "exe_sha256": "23967dd96b82ac9b5e993d96af19238bdd31edf03204658c3b5056b5c02bf0b8"
+}
