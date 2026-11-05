@@ -1,13 +1,14 @@
 {
-  "version": "1.0",
+  "version": "1.1",
   "platform": "Windows x64",
+  "input": "Folder with recursive .m3d scan",
   "target": "КОМПАС-3D v24",
   "build": "Python 3.11.9 / PyInstaller 6.16.0 / Wine",
   "verification": {
-    "logic_tests": 7,
+    "logic_tests": 13,
     "frozen_excel_export": true,
     "frozen_gui_launch": true,
     "kompas_integration_tested": false
   },
-  "exe_sha256": "23967dd96b82ac9b5e993d96af19238bdd31edf03204658c3b5056b5c02bf0b8"
+  "exe_sha256": "502b4b9b665649be7e70f97852882355e116d0bb1f544b8f8f7c3e5e3e366456"
 }

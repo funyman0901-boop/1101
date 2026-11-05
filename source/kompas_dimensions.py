@@ -48,13 +48,30 @@ def parse_section(xml):
 class Kompas:
     def __init__(self):
         import pythoncom
-        from win32com.client import GetActiveObject, gencache
+        from win32com.client import GetActiveObject, Dispatch, gencache
         self.api = gencache.EnsureModule(
             "{69AC2981-37C0-4379-84FD-5DD2F3C0A520}", 0, 1, 0)
-        obj = GetActiveObject("Kompas.Application.7")
+        obj = None
+        failures = []
+        for connect, progid in ((GetActiveObject, "Kompas.Application.7"),
+                                (GetActiveObject, "Kompas.Application.5"),
+                                (Dispatch, "Kompas.Application.7"),
+                                (Dispatch, "Kompas.Application.5")):
+            try:
+                obj = connect(progid)
+                if progid.endswith(".5"):
+                    obj = obj.ksGetApplication7()
+                break
+            except pythoncom.com_error as exc:
+                failures.append(str(exc))
+                obj = None
+        if obj is None:
+            raise RuntimeError("Не удалось подключиться к КОМПАС-3D или запустить его. "
+                               "Проверьте установку КОМПАС v24. " + "; ".join(failures))
         self.app = self.api.IApplication(obj._oleobj_.QueryInterface(
             self.api.IApplication.CLSID, pythoncom.IID_IDispatch))
         self.mng = self.api.IPropertyMng(self.app)
+        self.app.Visible = True
 
     def top(self, doc):
         return self.api.IKompasDocument3D(doc).TopPart
@@ -244,7 +261,7 @@ def export(folder, rows, log, counts):
     wb = Workbook()
     ws = wb.active
     ws.title = "Габариты"
-    ws.append(["Файл", "Обозначение", "Наименование", "Количество вставок", "Длина, мм",
+    ws.append(["Файл", "Обозначение", "Наименование", "Количество", "Длина, мм",
                "Ширина, мм", "Высота, мм", "Метод", "Запись свойств"])
     for row in rows:
         ws.append(row)
@@ -275,12 +292,55 @@ def export(folder, rows, log, counts):
         {"summary": counts, "items": log}, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def folder_groups(folder, excluded, log):
+    """Снимок списка файлов до открытия моделей, без переходов по ссылкам."""
+    folder = Path(folder).resolve()
+    if not folder.is_dir():
+        raise ValueError(f"Папка не найдена: {folder}")
+    excluded = [Path(p).resolve() for p in excluded]
+    def ignored(path):
+        path = Path(path).resolve()
+        return any(path == base or base in path.parents for base in excluded)
+    if ignored(folder):
+        raise ValueError("Папка моделей не должна находиться внутри папки отчётов или определений")
+    def onerror(exc):
+        log.append({"path": str(exc.filename or folder), "status": "scan_error", "reason": str(exc)})
+    groups = {}
+    for current, dirs, files in os.walk(folder, followlinks=False, onerror=onerror):
+        retained = []
+        for name in sorted(dirs, key=str.casefold):
+            child = Path(current) / name
+            try:
+                attrs = getattr(child.lstat(), "st_file_attributes", 0)
+                if not ignored(child) and not child.is_symlink() and not (attrs & 0x400):
+                    retained.append(name)
+            except OSError as exc:
+                onerror(exc)
+        dirs[:] = retained
+        for name in sorted(files, key=str.casefold):
+            path = Path(current) / name
+            if path.suffix.lower() != ".m3d" or path.is_symlink() or ignored(path):
+                continue
+            try:
+                if not path.is_file():
+                    raise OSError(f"Файл недоступен: {path}")
+                rec = {"path": str(path), "trace": str(path.relative_to(folder)),
+                       "status": "", "reason": ""}
+                groups.setdefault(key(path), {"path": str(path), "items": [rec], "blocked": False})
+                log.append(rec)
+            except OSError as exc:
+                onerror(exc)
+    return groups
+
+
 def run(k, args):
-    root = k.app.ActiveDocument
-    if not root or int(root.DocumentType) != 5:
-        raise RuntimeError("Активным документом должна быть сборка .a3d")
-    if not root.PathName or root.Changed:
-        raise RuntimeError("Сначала сохраните сборку")
+    input_folder = getattr(args, "folder", None)
+    root = None if input_folder else k.app.ActiveDocument
+    if not input_folder:
+        if not root or int(root.DocumentType) != 5:
+            raise RuntimeError("Активным документом должна быть сборка .a3d")
+        if not root.PathName or root.Changed:
+            raise RuntimeError("Сначала сохраните сборку")
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     folder = Path(args.output).resolve() / stamp
     folder.mkdir(parents=True)
@@ -297,8 +357,11 @@ def run(k, args):
                 if not p or p.Name != name or p.DataType != 2 or p.IsVariable:
                     raise RuntimeError(f"Повреждён источник определений {name}")
                 prototypes[name] = p
-        groups = collect(k, root, log)
-        for group in groups.values():
+        groups = folder_groups(input_folder, (args.output, args.schema), log) if input_folder else collect(k, root, log)
+        print(f"Найдено уникальных файлов: {len(groups)}", flush=True)
+        if not groups:
+            print("Файлы .m3d не найдены. Проверьте выбранную папку и журнал чтения папок.", flush=True)
+        for index, group in enumerate(groups.values(), 1):
             pending = [r for r in group["items"] if not r["status"]]
             if not pending:
                 continue
@@ -309,20 +372,21 @@ def run(k, args):
             path = Path(group["path"])
             doc, owned = None, False
             try:
-                print(f"Деталь: {path}", flush=True)
+                print(f"[{index}/{len(groups)}] Деталь: {path}", flush=True)
                 already = k.opened().get(key(path))
                 if already and (already.Changed or args.write):
                     raise RuntimeError("Закройте отдельное окно детали перед записью; сохраните изменения перед измерением")
                 doc = already or k.open(path, not args.write)
                 owned = already is None
-                if args.write and doc.ReadOnly:
-                    raise RuntimeError("Файл открыт только для чтения")
                 part = k.top(doc)
                 cat, section = k.category(doc, part)
                 if cat != "normal":
                     for r in pending:
                         r.update(status=cat, section=section, reason="Категория исходного файла")
+                    print(f"  Пропущено: {section or cat}", flush=True)
                     continue
+                if args.write and doc.ReadOnly:
+                    raise RuntimeError("Файл открыт только для чтения")
                 count = k.api.IEmbodimentsManager(part).EmbodimentCount
                 if count > 1:
                     raise RuntimeError("Файл содержит несколько исполнений; требуется отдельная обработка исполнений")
@@ -331,7 +395,7 @@ def run(k, args):
                 name = str(part.Name or "")
                 saved = "не запрошена"
                 if args.write:
-                    backup = folder / "backups" / f"{len(rows) + 1:06d}" / path.name
+                    backup = folder / "backups" / f"{index:06d}" / path.name
                     backup.parent.mkdir(parents=True)
                     shutil.copy2(path, backup)
                     write_values(k, doc, part, prototypes, values)
@@ -362,25 +426,28 @@ def run(k, args):
         tally = Counter(r["status"] for r in log)
         counts = {
             "Обработано уникальных файлов": len(rows),
-            "Обработано вставок": tally["processed"],
-            "Пропущено стандартных изделий (вставок)": tally["standard"],
-            "Пропущено прочих изделий (вставок)": tally["other"],
-            "Ошибок обработки (вставок)": tally["error"],
+            "Обработано файлов" if input_folder else "Обработано вставок": tally["processed"],
+            "Пропущено стандартных изделий": tally["standard"],
+            "Пропущено прочих изделий": tally["other"],
+            "Ошибок обработки": tally["error"],
             "Конфликтов категорий (вставок)": tally["conflict"],
             "Без отдельного файла .m3d (вставок)": tally["unsupported"],
             "Ошибок закрытия": tally["close_error"],
+            "Ошибок чтения папок": tally["scan_error"],
+            "Источник": str(input_folder or root.PathName),
             "Метод": args.mode,
         }
         export(folder, rows, log, counts)
         print(json.dumps(counts, ensure_ascii=False, indent=2))
         print(f"Результаты: {folder}")
-        return 2 if any(tally[s] for s in ("error", "conflict", "unsupported", "close_error")) else 0
+        return 2 if not groups or any(tally[s] for s in ("error", "conflict", "unsupported", "close_error", "scan_error")) else 0
     finally:
         # JSON сохраняется даже при сбое экспорта Excel.
         (folder / "processing.json").write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
         if seed_doc is not None:
             close(seed_doc)
-        root.Active = True
+        if root is not None:
+            root.Active = True
 
 
 def main():
@@ -390,6 +457,7 @@ def main():
     parser.add_argument("--mode", choices=("bbox", "parameters"), default="bbox")
     parser.add_argument("--schema", default="dimension_properties")
     parser.add_argument("--output", default="dimension_reports")
+    parser.add_argument("--folder", help="Папка с деталями .m3d, включая вложенные папки")
     args = parser.parse_args()
     import pythoncom
     pythoncom.CoInitialize()

@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace as NS
 from openpyxl import load_workbook
@@ -20,6 +21,144 @@ def part(path, cat="normal", children=()):
 
 
 class Tests(unittest.TestCase):
+    def test_recursive_folder_and_exclusions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'sub' / 'deep').mkdir(parents=True)
+            (root / 'reports' / 'backups').mkdir(parents=True)
+            (root / 'schema').mkdir()
+            for name in ('one.m3d', 'sub/two.M3D', 'sub/deep/three.m3d',
+                         'sub/ignored.a3d', 'reports/backups/copy.m3d', 'schema/seed.m3d'):
+                (root / name).write_bytes(b'model')
+            log = []
+            groups = m.folder_groups(root, (root/'reports', root/'schema'), log)
+            self.assertEqual(len(groups), 3)
+            self.assertEqual({Path(g['path']).name for g in groups.values()},
+                             {'one.m3d', 'two.M3D', 'three.m3d'})
+            self.assertTrue(all(not g['blocked'] for g in groups.values()))
+
+    def test_missing_folder_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                m.folder_groups(Path(tmp)/'missing', [], [])
+            with self.assertRaises(ValueError):
+                m.folder_groups(tmp, [tmp], [])
+
+    def test_folder_does_not_follow_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models = root/'models'
+            models.mkdir()
+            (root/'outside').mkdir()
+            (root/'outside'/'do_not_open.m3d').write_bytes(b'x')
+            try:
+                (models/'link').symlink_to(root/'outside', target_is_directory=True)
+            except OSError:
+                self.skipTest('Symlinks unavailable on this system')
+            self.assertEqual(m.folder_groups(models, [], []), {})
+
+    def test_folder_run_without_assembly_continues_after_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models = root/'models'
+            models.mkdir()
+            for name in ('good.m3d','broken.m3d','other.m3d','standard.m3d'):
+                (models/name).write_bytes(b'model')
+            opened, measured, closed = [], [], []
+            class Doc:
+                Changed = False
+                ReadOnly = False
+                def __init__(self, path):
+                    self.path = Path(path)
+                    self.part = NS(Marking='ABC.001', Name='Брус')
+                def Close(self, option):
+                    closed.append(self.path.name)
+                    return True
+            class Fake:
+                # app deliberately has no ActiveDocument
+                app = NS()
+                api = NS(IEmbodimentsManager=lambda p: NS(EmbodimentCount=1))
+                def opened(self): return {}
+                def open(self, path, readonly):
+                    opened.append(Path(path).name)
+                    return Doc(path)
+                def top(self, doc):
+                    doc.part.filename = doc.path.name
+                    return doc.part
+                def category(self, doc, part):
+                    cat = {'other.m3d':'other', 'standard.m3d':'standard'}.get(doc.path.name, 'normal')
+                    return cat, cat
+                def measure(self, part, mode):
+                    measured.append(part.filename)
+                    if part.filename == 'broken.m3d':
+                        raise RuntimeError('Cannot measure')
+                    return (2500,100,100)
+            args = NS(folder=str(models), output=str(root/'reports'), schema=str(root/'schema'), write=False, mode='bbox')
+            self.assertEqual(m.run(Fake(), args), 2)
+            report = next((root/'reports').glob('*/journal.json'))
+            import json
+            journal = json.loads(report.read_text(encoding='utf-8'))
+            self.assertEqual(journal['summary']['Обработано уникальных файлов'], 1)
+            self.assertEqual(journal['summary']['Пропущено прочих изделий'], 1)
+            self.assertEqual(journal['summary']['Пропущено стандартных изделий'], 1)
+            self.assertEqual(set(measured), {'good.m3d','broken.m3d'})
+            self.assertEqual(len(closed), 4)
+
+    def test_empty_folder_still_exports_journal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            models = root/'models'
+            models.mkdir()
+            args = NS(folder=str(models), output=str(root/'reports'), schema=str(root/'schema'), write=False, mode='bbox')
+            self.assertEqual(m.run(NS(app=NS()), args), 2)
+            self.assertEqual(len(list((root/'reports').glob('*/dimensions.xlsx'))), 1)
+
+    def test_folder_write_backup_and_saved_readback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            import json
+            root = Path(tmp)
+            models, schema = root/'models', root/'schema'
+            schema.mkdir()
+            (schema/'properties.json').write_text(json.dumps(dict(zip(m.NAMES, (101,102,103)))), encoding='utf-8')
+            for sub in ('a','b'):
+                (models/sub).mkdir(parents=True)
+                (models/sub/'same.m3d').write_bytes(sub.encode())
+            saved, reopened = [], []
+            values_by_path = {}
+            class Doc:
+                Changed = False
+                ReadOnly = False
+                def __init__(self, path):
+                    self.path = Path(path)
+                    self.part = NS(Marking='ABC.001', Name='Брус', path=str(self.path))
+                def Close(self, option): return True
+                def Save(self):
+                    saved.append(str(self.path))
+                    values_by_path[str(self.path)] = (2500,100,100)
+            class Fake:
+                app = NS()
+                api = NS(IEmbodimentsManager=lambda p: NS(EmbodimentCount=1))
+                def opened(self): return {}
+                def open(self, path, readonly):
+                    reopened.append((str(path), readonly))
+                    return Doc(path)
+                def top(self, doc): return doc.part
+                def category(self, doc, part): return 'normal', ''
+                def measure(self, part, mode): return (2500,100,100)
+                def prop(self, doc, ident):
+                    return NS(Id=ident, Name=m.NAMES[int(ident)-101], DataType=2, IsVariable=False)
+                def read(self, part, prop): return values_by_path[part.path][int(prop.Id)-101]
+            def write(k, doc, part, prototypes, values):
+                if doc.path.parent.name == 'a':
+                    raise RuntimeError('Simulated write failure')
+            args = NS(folder=str(models), output=str(root/'reports'), schema=str(schema), write=True, mode='bbox')
+            with patch.object(m, 'write_values', write):
+                self.assertEqual(m.run(Fake(), args), 2)
+            self.assertEqual(saved, [str(models/'b'/'same.m3d')])
+            backups = sorted((root/'reports').glob('*/backups/*/same.m3d'))
+            self.assertEqual([p.read_bytes() for p in backups], [b'a', b'b'])
+            self.assertIn((str(models/'b'/'same.m3d'), True), reopened)
+
     def test_axis_independent(self):
         for dims in ((100, 100, 2500), (100, 2500, 100), (2500, 100, 100)):
             self.assertEqual(m.dimensions(dims), (2500, 100, 100))

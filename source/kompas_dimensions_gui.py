@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Нативное окно Windows для обработки сборок КОМПАС-3D v24."""
+"""Нативное окно Windows: рекурсивная обработка папок с деталями .m3d."""
 import contextlib
 import io
 import json
@@ -22,7 +22,7 @@ from win32com.shell import shell, shellcon
 
 import kompas_dimensions as core
 
-APP_NAME = "Габариты деталей — КОМПАС-3D v24"
+APP_NAME = "Габариты деталей 1.1 — обработка папки — КОМПАС-3D v24"
 DATA = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "KompasDimensions"
 SCHEMA = DATA / "properties"
 UPDATE = C.WM_APP + 1
@@ -67,34 +67,39 @@ class Window:
         G.RegisterClass(wc)
         style = C.WS_OVERLAPPED | C.WS_CAPTION | C.WS_SYSMENU | C.WS_MINIMIZEBOX
         self.hwnd = G.CreateWindow(wc.lpszClassName, APP_NAME, style,
-                                  C.CW_USEDEFAULT, C.CW_USEDEFAULT, 800, 630,
+                                  C.CW_USEDEFAULT, C.CW_USEDEFAULT, 800, 735,
                                   0, 0, instance, None)
         self.font = G.GetStockObject(17)  # DEFAULT_GUI_FONT
-        self.add("STATIC", "1. Откройте и сохраните сборку в КОМПАС-3D v24.",
+        self.add("STATIC", "1. Выберите папку с деталями .m3d. Вложенные папки проверяются автоматически.",
                  20, 18, 750, 23)
-        self.add("STATIC", "2. Выберите способ измерения и действие.",
+        self.add("STATIC", "2. Нажмите «Записать свойства + Excel». Открытая сборка не требуется.",
                  20, 44, 750, 23)
-        self.add("BUTTON", "Габариты готовой модели", 20, 80, 350, 28,
+        self.add("STATIC", "Папка с деталями:", 20, 80, 750, 23)
+        self.input_edit = self.add("EDIT", "", 20, 106, 580, 27,
+                                  303, C.WS_BORDER | C.ES_AUTOHSCROLL)
+        self.add("BUTTON", "Выбрать папку...", 610, 105, 145, 30, 104)
+        self.add("BUTTON", "Габариты готовой модели", 20, 157, 350, 28,
                  201, C.BS_RADIOBUTTON)
-        self.add("BUTTON", "Размеры заготовки по переменным", 380, 80, 380, 28,
+        self.add("BUTTON", "Размеры заготовки по переменным", 380, 157, 380, 28,
                  202, C.BS_RADIOBUTTON)
         G.SendMessage(self.controls[201], C.BM_SETCHECK, C.BST_CHECKED, 0)
         self.add("STATIC", "Для заготовки нужны переменные BLANK_L, BLANK_W, BLANK_H (мм).",
-                 20, 115, 750, 23)
-        self.add("STATIC", "Папка отчётов:", 20, 152, 150, 22)
-        self.path_edit = self.add("EDIT", str(self.output), 20, 177, 735, 26,
+                 20, 192, 750, 23)
+        self.add("STATIC", "Папка отчётов:", 20, 229, 150, 22)
+        self.path_edit = self.add("EDIT", str(self.output), 20, 254, 735, 26,
                                   301, C.WS_BORDER | C.ES_AUTOHSCROLL)
-        self.add("BUTTON", "Сформировать Excel", 20, 222, 220, 38, 101)
-        self.add("BUTTON", "Записать свойства + Excel", 250, 222, 285, 38, 102)
-        self.add("BUTTON", "Открыть отчёты", 545, 222, 210, 38, 103)
+        self.add("BUTTON", "Сформировать Excel", 20, 299, 220, 38, 101)
+        self.add("BUTTON", "Записать свойства + Excel", 250, 299, 285, 38, 102)
+        self.add("BUTTON", "Открыть отчёты", 545, 299, 210, 38, 103)
         self.add("STATIC", "Стандартные и прочие изделия пропускаются. Размеры — числа в мм.",
-                 20, 278, 750, 24)
-        self.add("STATIC", "Журнал обработки:", 20, 312, 750, 23)
-        self.log = self.add("EDIT", "Готово к работе.\r\n", 20, 340, 735, 210,
+                 20, 355, 750, 24)
+        self.add("STATIC", "Журнал обработки:", 20, 389, 750, 23)
+        self.log = self.add("EDIT", "Выберите папку с деталями.\r\n", 20, 417, 735, 230,
                              302, C.WS_BORDER | C.ES_MULTILINE | C.ES_READONLY |
                              C.WS_VSCROLL | C.ES_AUTOVSCROLL)
-        self.add("STATIC", "Перед первым запуском с записью используйте копию сборки.",
-                 20, 563, 750, 23)
+        G.SendMessage(self.log, C.EM_SETLIMITTEXT, 2000000, 0)
+        self.add("STATIC", "Перед записью создаются резервные копии. Сборки .a3d не обрабатываются.",
+                 20, 660, 750, 23)
         G.ShowWindow(self.hwnd, C.SW_SHOW)
         G.UpdateWindow(self.hwnd)
 
@@ -118,18 +123,13 @@ class Window:
         G.SendMessage(self.log, C.EM_SETSEL, -1, -1)
         G.SendMessage(self.log, C.EM_REPLACESEL, False, text)
 
-    def worker(self, write, output, mode):
+    def worker(self, write, output, mode, input_folder):
         pythoncom.CoInitialize()
         try:
             writer = LogWriter(lambda text: self.post("log", text))
             with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
                 prepare_cache()
                 k = core.Kompas()
-                root = k.app.ActiveDocument
-                if not root or int(root.DocumentType) != 5:
-                    raise RuntimeError("Откройте сборку .a3d и сделайте её активной в КОМПАС.")
-                if not root.PathName or root.Changed:
-                    raise RuntimeError("Сохраните сборку перед обработкой.")
                 if write:
                     seed = SCHEMA / "dimensions_seed.m3d"
                     registry = SCHEMA / "properties.json"
@@ -138,10 +138,9 @@ class Window:
                     if not seed.exists():
                         print("Создание общих определений свойств...")
                         core.init_properties(k, SCHEMA)
-                        root.Active = True
-                print("Обработка: " + str(root.PathName))
+                print("Папка моделей: " + str(input_folder))
                 args = SimpleNamespace(write=write, mode=mode,
-                                       schema=str(SCHEMA), output=str(output))
+                                       schema=str(SCHEMA), output=str(output), folder=str(input_folder))
                 code = core.run(k, args)
                 print("Завершено." if code == 0 else
                       "Завершено с пропусками или ошибками. См. журнал в отчёте.")
@@ -156,16 +155,41 @@ class Window:
     def start(self, write):
         if self.busy:
             return
+        raw_input = G.GetWindowText(self.input_edit).strip().strip('"')
+        input_folder = Path(raw_input).expanduser()
+        if not raw_input or not input_folder.is_absolute() or not input_folder.is_dir():
+            G.MessageBox(self.hwnd, "Выберите существующую папку с деталями .m3d.", APP_NAME, C.MB_ICONWARNING)
+            return
         output = Path(G.GetWindowText(self.path_edit).strip()).expanduser()
         if not output.is_absolute():
             G.MessageBox(self.hwnd, "Укажите полный путь к папке отчётов.", APP_NAME, C.MB_ICONWARNING)
             return
         self.output = output
         self.busy = True
-        for ident in (101, 102, 201, 202, 301):
+        for ident in (101, 102, 104, 201, 202, 301, 303):
             G.EnableWindow(self.controls[ident], False)
         self.append("\n" + ("Запись свойств и Excel" if write else "Только Excel") + "\n")
-        threading.Thread(target=self.worker, args=(write, output, self.mode), daemon=True).start()
+        threading.Thread(target=self.worker, args=(write, output, self.mode, input_folder), daemon=True).start()
+
+    def choose_folder(self):
+        pythoncom.CoInitialize()
+        try:
+            result = shell.SHBrowseForFolder(self.hwnd, None,
+                "Выберите папку с деталями .m3d (включая вложенные папки)",
+                shellcon.BIF_RETURNONLYFSDIRS | shellcon.BIF_NEWDIALOGSTYLE)
+            if not result:
+                return
+            chosen = result[0]
+            if chosen:
+                path = shell.SHGetPathFromIDList(chosen)
+                if isinstance(path, bytes):
+                    path = path.decode("mbcs")
+                G.SetWindowText(self.input_edit, path)
+        except Exception as exc:
+            G.MessageBox(self.hwnd, "Не удалось открыть выбор папки. Введите путь вручную.\n" + str(exc),
+                         APP_NAME, C.MB_ICONWARNING)
+        finally:
+            pythoncom.CoUninitialize()
 
     def proc(self, hwnd, msg, wp, lp):
         if msg == C.WM_COMMAND:
@@ -177,6 +201,8 @@ class Window:
                                   C.BST_CHECKED if choice == ident else C.BST_UNCHECKED, 0)
             elif ident in (101, 102):
                 self.start(ident == 102)
+            elif ident == 104:
+                self.choose_folder()
             elif ident == 103:
                 try:
                     self.output.mkdir(parents=True, exist_ok=True)
@@ -191,7 +217,7 @@ class Window:
                     self.append(value)
                 elif kind == "done":
                     self.busy = False
-                    for ident in (101, 102, 201, 202, 301):
+                    for ident in (101, 102, 104, 201, 202, 301, 303):
                         G.EnableWindow(self.controls[ident], True)
             return 0
         if msg == C.WM_CLOSE:
