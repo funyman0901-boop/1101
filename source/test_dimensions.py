@@ -21,6 +21,52 @@ def part(path, cat="normal", children=()):
 
 
 class Tests(unittest.TestCase):
+    def category_fixture(self, result=(False, None, False), complex_value=None, storage=None, standard=False, has_property=True):
+        keeper = NS(IsComplexPropertyValue=lambda p: complex_value is not None,
+                    GetPropertyValue=lambda *a: result,
+                    GetComplexPropertyValue=lambda *a: (complex_value, False), Properties=storage)
+        k = object.__new__(m.Kompas)
+        k.api = NS(IPropertyKeeper=lambda p: keeper)
+        k.prop = lambda *a: NS(Name='Раздел спецификации') if has_property else None
+        return k, NS(Standard=standard)
+
+    def test_unset_category_response_from_user_log(self):
+        k, part = self.category_fixture()
+        self.assertEqual(k.category(None, part), ('normal', 'Не задан'))
+
+    def test_missing_category_definition(self):
+        k, part = self.category_fixture(has_property=False)
+        self.assertEqual(k.category(None, part)[0], 'normal')
+
+    def test_empty_category_success(self):
+        for value in (None, ''):
+            k, part = self.category_fixture(result=(True, value, False))
+            self.assertEqual(k.category(None, part)[0], 'normal')
+
+    def test_explicit_excluded_categories_preserved(self):
+        for name, expected in (('Прочие изделия','other'),('Стандартные изделия','standard')):
+            xml = f'<document><property id="sectionName" value="{name}"/></document>'
+            k, part = self.category_fixture(complex_value=xml)
+            self.assertEqual(k.category(None, part)[0], expected)
+            k, part = self.category_fixture(result=(True, name, False))
+            self.assertEqual(k.category(None, part)[0], expected)
+            storage = f'<infObject><property id="SPCSection"><property id="sectionName" value="{name}"/></property></infObject>'
+            k, part = self.category_fixture(storage=storage)
+            self.assertEqual(k.category(None, part)[0], expected)
+        k, part = self.category_fixture(standard=True)
+        self.assertEqual(k.category(None, part)[0], 'standard')
+
+    def test_unreadable_category_does_not_default(self):
+        for result in ((False, 'unknown', False), (False, None, True), (False, None)):
+            k, part = self.category_fixture(result=result)
+            with self.assertRaises(RuntimeError):
+                k.category(None, part)
+
+    def test_numeric_property_reads_stay_strict(self):
+        k, part = self.category_fixture()
+        with self.assertRaises(RuntimeError):
+            k.read(part, NS(Name='Длина'))
+
     def test_recursive_folder_and_exclusions(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

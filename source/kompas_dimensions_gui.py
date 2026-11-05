@@ -22,7 +22,7 @@ from win32com.shell import shell, shellcon
 
 import kompas_dimensions as core
 
-APP_NAME = "Габариты деталей 1.1 — обработка папки — КОМПАС-3D v24"
+APP_NAME = "Габариты деталей 1.2 — обработка папки — КОМПАС-3D v24"
 DATA = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "KompasDimensions"
 SCHEMA = DATA / "properties"
 UPDATE = C.WM_APP + 1

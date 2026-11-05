@@ -40,7 +40,7 @@ def parse_section(xml):
     for node in root.iter():
         if node.get("id") == "sectionName":
             return node.get("value", "").strip()
-    if root.tag == "document" and not list(root):
+    if (root.tag == "document" or root.get("id") == "SPCSection") and not list(root):
         return ""  # раздел явно не задан
     raise ValueError("Неизвестный формат раздела спецификации")
 
@@ -95,7 +95,7 @@ class Kompas:
             return "standard", "IPart7.Standard"
         p = self.prop(doc, 20.0)
         if not p:
-            raise RuntimeError("Недоступно системное свойство 20: Раздел спецификации")
+            return "normal", "Не задан"
         keeper = self.api.IPropertyKeeper(part)
         if keeper.IsComplexPropertyValue(p):
             result = keeper.GetComplexPropertyValue(p, False)
@@ -103,7 +103,32 @@ class Kompas:
                 raise RuntimeError(f"Неизвестный ответ GetComplexPropertyValue: {result!r}")
             name = parse_section(result[0])
         else:
-            value = self.read(part, p)
+            result = keeper.GetPropertyValue(p, None, False, False)
+            if not isinstance(result, tuple) or len(result) != 3:
+                raise RuntimeError(f"Неизвестный ответ раздела спецификации: {result!r}")
+            # КОМПАС v24: незаданное значение может возвращать False, None, False.
+            # Это правило относится только к категории, не к чтению размеров.
+            if not result[0]:
+                if result[1] is None and not result[2]:
+                    # Дополнительно проверяем XML-хранилище: явно заданная
+                    # исключённая категория не должна потеряться при чтении.
+                    try:
+                        storage = keeper.Properties
+                    except AttributeError:
+                        storage = None
+                    if isinstance(storage, str) and storage.strip():
+                        xml = ET.fromstring(storage)
+                        sections = [node for node in xml.iter() if node.get("id") == "SPCSection"]
+                        name = parse_section(ET.tostring(sections[0], encoding="unicode")) if sections else ""
+                    else:
+                        name = ""
+                    if name.casefold() == "стандартные изделия":
+                        return "standard", name
+                    if name.casefold() == "прочие изделия":
+                        return "other", name
+                    return "normal", name or "Не задан"
+                raise RuntimeError(f"Не прочитан раздел спецификации: {result!r}")
+            value = result[1]
             if value is not None and not isinstance(value, str):
                 raise RuntimeError(f"Неизвестный формат раздела: {value!r}")
             name = (value or "").strip()
@@ -380,6 +405,10 @@ def run(k, args):
                 owned = already is None
                 part = k.top(doc)
                 cat, section = k.category(doc, part)
+                for r in pending:
+                    r["section"] = section or "Не задан"
+                if cat == "normal" and section in ("", "Не задан"):
+                    print("  Раздел не задан — обрабатывается как обычная деталь.", flush=True)
                 if cat != "normal":
                     for r in pending:
                         r.update(status=cat, section=section, reason="Категория исходного файла")
