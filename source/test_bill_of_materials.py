@@ -39,16 +39,56 @@ class BillTests(unittest.TestCase):
                            ('Труба 50х50х3 Ст3','Труба 50х50х3 09Г2С','Труба 60х60х3 Ст3')])
         self.assertEqual(len(rows),3)
 
-    def test_sheet_rows_by_material_thickness_and_size(self):
+    def test_sheet_area_by_material_and_thickness(self):
         rows=bom.aggregate([
             {'material':'Лист Ст3','dimensions':(500,300,4),'quantity':2},
             {'material':'Лист Ст3','dimensions':(500,300,4),'quantity':3},
             {'material':'Лист Ст3','dimensions':(500,300,5),'quantity':1},
             {'material':'Лист Ст3','dimensions':(600,300,4),'quantity':1}])
-        self.assertEqual(len(rows),3)
-        first=next(r for r in rows if '500 × 300' in r['label'] and 't=4 ' in r['label'])
-        self.assertEqual(first['quantity'],5)
+        self.assertEqual(len(rows),2)
+        first=next(r for r in rows if 't=4 ' in r['label'])
+        self.assertAlmostEqual(first['area'],0.93)
+        self.assertIsNone(first['quantity'])
         self.assertTrue(all(r['length'] is None for r in rows))
+
+    def test_wood_sums_lengths_across_different_cut_lengths(self):
+        rows=bom.aggregate([
+            {'material':'Доска сосна 50х150х1000 ГОСТ 8486','dimensions':(1000,150,50),'quantity':4},
+            {'material':'Доска сосна 50х150х2000 ГОСТ 8486','dimensions':(2000,150,50),'quantity':2}])
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['length'],8000)
+        self.assertIsNone(rows[0]['quantity'])
+        self.assertIsNone(rows[0]['area'])
+
+    def test_wood_species_recognition_and_section_separation(self):
+        rows=bom.aggregate([
+            {'material':'Сосна ГОСТ 8486','dimensions':(1000,150,50),'quantity':2},
+            {'material':'Сосна ГОСТ 8486','dimensions':(2000,150,50),'quantity':1},
+            {'material':'Сосна ГОСТ 8486','dimensions':(1000,100,50),'quantity':1},
+            {'material':'Лиственница ГОСТ 8486','dimensions':(1000,150,50),'quantity':1}])
+        self.assertEqual(len(rows),3)
+        self.assertEqual(sorted(r['length'] for r in rows),[1000,1000,4000])
+        self.assertEqual(bom.material_type('Пиломатериалы сосна'),'wood')
+        self.assertEqual(bom.material_type('Фанера берёзовая'),'sheet')
+
+    def test_sheet_stock_sizes_in_material_name_do_not_split_area(self):
+        rows=bom.aggregate([
+            {'material':'Фанера берёза 1525х1525х18','dimensions':(1000,500,18),'quantity':2},
+            {'material':'Фанера берёза 2500х1250х18','dimensions':(500,500,18),'quantity':4}])
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['area'],2)
+
+    def test_fractional_area_and_numeric_export_column(self):
+        rows=bom.aggregate([{'material':'Лист Ст3','dimensions':(333.333,250,2),'quantity':3}])
+        self.assertAlmostEqual(rows[0]['area'],0.24999975)
+        with tempfile.TemporaryDirectory() as tmp:
+            path,title=bom.export(Path(tmp),rows,[],'test.a3d','TEST')
+            wb=load_workbook(path,data_only=False)
+            self.assertEqual(wb.active.max_column,5)
+            self.assertEqual(wb.active['D5'].value,0.24999975)
+            self.assertIsNone(wb.active['C5'].value)
+            self.assertIsNone(wb.active['E5'].value)
+            self.assertFalse(any(c.data_type=='f' for row in wb.active for c in row))
 
     def test_piece_sections_and_unclassified_last(self):
         rows=bom.aggregate([

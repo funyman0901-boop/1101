@@ -19,22 +19,45 @@ def normalized(value):
 
 def material_type(material):
     text = normalized(material)
-    sheet = re.search(r'\b(лист\w*|фанер\w*|дсп|лдсп|мдф|двп|осб|osb|поликарбонат\w*)\b', text)
+    sheet = re.search(r'\b(лист(?!венн)\w*|фанер\w*|дсп|лдсп|мдф|двп|осб|osb|поликарбонат\w*)\b', text)
     linear = re.search(r'\b(труб\w*|профил\w*|угол\w*|швеллер\w*|двутавр\w*|круг\w*|'
-                 r'прут\w*|брус\w*|доск\w*|рейк\w*|полос\w*|арматур\w*|квадрат\w*|шестигранник\w*)\b', text)
+                 r'прут\w*|полос\w*|арматур\w*|квадрат\w*|шестигранник\w*)\b', text)
+    wood = re.search(r'\b(пиломатериал\w*|древесин\w*|деревян\w*|брус\w*|доск\w*|рейк\w*|'
+                     r'вагонк\w*|штакетник\w*|сосн\w*|ель|ели|елов\w*|лиственн\w*|'
+                     r'берез\w*|дуб\w*|бук\w*|осин\w*|кедр\w*|липа)\b', text)
     if sheet and (not linear or sheet.start() < linear.start()):
         return 'sheet'
+    if wood:
+        return 'wood'
     if linear:
         return 'linear'
     return 'unknown'
 
 
-def number(value):
-    return f'{value:.3f}'.rstrip('0').rstrip('.')
+def number(value, digits=3):
+    return f'{value:.{digits}f}'.rstrip('0').rstrip('.')
+
+
+def wood_material(material):
+    """В тройке размеров пиломатериала убирает длину, оставляя сечение."""
+    numeric = r'\d+(?:[.,]\d+)?'
+    pattern = rf'({numeric})\s*[xх×]\s*({numeric})\s*[xх×]\s*({numeric})'
+    def cross_section(match):
+        sizes = sorted(float(v.replace(',','.')) for v in match.groups())
+        return f'{number(sizes[1])} × {number(sizes[0])}'
+    return re.sub(pattern,cross_section,material,flags=re.IGNORECASE)
+
+
+def sheet_material(material):
+    numeric = r'\d+(?:[.,]\d+)?'
+    pattern = rf'({numeric})\s*[xх×]\s*({numeric})\s*[xх×]\s*({numeric})'
+    def thickness_only(match):
+        return 't='+number(min(float(v.replace(',','.')) for v in match.groups()))
+    return re.sub(pattern,thickness_only,material,flags=re.IGNORECASE)
 
 
 def aggregate(items):
-    """Не объединяет разные марки материалов или листы разного размера."""
+    """Пиломатериалы — по материалу и сечению; листы — по материалу и толщине."""
     groups = {}
     for item in items:
         qty = item.get('quantity', 1)
@@ -48,6 +71,7 @@ def aggregate(items):
         identity = (normalized(name), normalized(marking))
         label = f'{name} — {marking}' if marking else name
         kind = material_type(material)
+        area = None
         if item.get('error'):
             section = SECTIONS[3]
             label += ' [не удалось определить данные]'
@@ -59,7 +83,7 @@ def aggregate(items):
             if material:
                 label += '; ' + material
             length, pieces = None, qty
-        elif material and kind in ('linear', 'sheet') and dims:
+        elif material and kind in ('linear', 'wood', 'sheet') and dims:
             if len(dims) != 3 or any(not math.isfinite(float(v)) or v <= 0 for v in dims):
                 raise ValueError('Некорректные размеры заготовки')
             section = SECTIONS[0]
@@ -67,12 +91,19 @@ def aggregate(items):
                 ident = (section, kind, normalized(material))
                 label = material
                 length, pieces = float(dims[0]) * qty, None
+            elif kind == 'wood':
+                cross = tuple(round(float(v),3) for v in dims[1:])
+                material_base = wood_material(material)
+                ident = (section, kind, normalized(material_base), *cross)
+                label = f'{material_base}; сечение {number(cross[0])} × {number(cross[1])} мм'
+                length, pieces = float(dims[0])*qty, None
             else:
                 length_mm, width, thickness = (round(float(v), 3) for v in dims)
-                ident = (section, kind, normalized(material), thickness, length_mm, width)
-                label = (f'{material}; t={number(thickness)} мм; '
-                         f'{number(length_mm)} × {number(width)} мм')
-                length, pieces = None, qty
+                material_base = sheet_material(material)
+                ident = (section, kind, normalized(material_base), thickness)
+                label = f'{material_base}; t={number(thickness)} мм'
+                area = length_mm*width*qty/1000000
+                length, pieces = None, None
         else:
             section = SECTIONS[3]
             label += f'; материал: {material}' if material else '; материал не задан'
@@ -80,12 +111,14 @@ def aggregate(items):
             length, pieces = None, qty
         if ident not in groups:
             groups[ident] = {'section': section, 'label': label, 'length': length,
-                            'quantity': pieces, 'members': [], 'sort': ident[1:]}
+                            'area': area, 'quantity': pieces, 'members': [], 'sort': ident[1:]}
         else:
             if length is not None:
                 groups[ident]['length'] += length
             if pieces is not None:
                 groups[ident]['quantity'] += pieces
+            if area is not None:
+                groups[ident]['area'] += area
         groups[ident]['members'].append(item)
     result = []
     for section in SECTIONS:
@@ -97,6 +130,8 @@ def aggregate(items):
         for row in group:
             if row['length'] is not None:
                 row['length'] = round(row['length'], 3)
+            if row['area'] is not None:
+                row['area'] = round(row['area'], 8)
             row.pop('sort', None)
             result.append(row)
     return result
@@ -198,18 +233,18 @@ def export(folder, rows, journal, assembly, marking):
     title = f'Ведомость: {Path(assembly).name}; исполнение: {marking or "основное"}'
     if errors:
         title = f'НЕПОЛНЫЙ ОТЧЁТ — ошибок: {errors}. ' + title
-    ws.merge_cells('A1:D1')
+    ws.merge_cells('A1:E1')
     ws['A1'] = title
     ws['A1'].font = Font(bold=True, color='B91C1C' if errors else '000000', size=12)
     ws['A1'].alignment = Alignment(wrap_text=True, vertical='center')
     ws.row_dimensions[1].height = 42
-    ws.merge_cells('A2:D2')
-    ws['A2'] = 'Линейный сортамент — суммарная длина; листы и покупные изделия — количество.'
+    ws.merge_cells('A2:E2')
+    ws['A2'] = 'Линейный сортамент и пиломатериалы — длина; листы — площадь; покупные изделия — штуки.'
     ws['A2'].alignment = Alignment(wrap_text=True)
     thin = Side(style='thin', color='000000')
     current = 4
     for section in SECTIONS:
-        headers = ('№', section, 'Длина (мм)\nна изделие', 'Кол-во (шт.)\nна изделие')
+        headers = ('№', section, 'Длина (мм)\nна изделие', 'Площадь (м²)\nна изделие', 'Кол-во (шт.)\nна изделие')
         for col, value in enumerate(headers, 1):
             cell = ws.cell(current, col, value)
             cell.font = Font(bold=True)
@@ -219,25 +254,25 @@ def export(folder, rows, journal, assembly, marking):
         current += 1
         section_rows = [row for row in rows if row['section'] == section]
         for i, row in enumerate(section_rows, 1):
-            for col, value in enumerate((i, row['label'], row['length'], row['quantity']), 1):
+            for col, value in enumerate((i, row['label'], row['length'], row['area'], row['quantity']), 1):
                 cell = ws.cell(current, col, value)
                 cell.alignment = Alignment(horizontal='left' if col == 2 else 'center',
                                            vertical='center', wrap_text=True)
                 if isinstance(value, float):
-                    cell.number_format = '0.###'
+                    cell.number_format = '0.########' if col == 4 else '0.###'
             ws.row_dimensions[current].height = max(30,15*math.ceil(len(row['label'])/65))
             current += 1
         if not section_rows:
             current += 1
         current += 1
-    for row in ws.iter_rows(min_row=4, max_row=current-2, max_col=4):
+    for row in ws.iter_rows(min_row=4, max_row=current-2, max_col=5):
         for cell in row:
             cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
     for row in ws:
         for cell in row:
             if isinstance(cell.value, str):
                 cell.data_type = 's'
-    for col, width in (('A',6),('B',76),('C',19),('D',21)):
+    for col, width in (('A',6),('B',76),('C',19),('D',19),('E',21)):
         ws.column_dimensions[col].width = width
     ws.freeze_panes = 'C5'
     ws.sheet_properties.pageSetUpPr.fitToPage = True
@@ -246,7 +281,7 @@ def export(folder, rows, journal, assembly, marking):
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
     ws.print_options.horizontalCentered = True
-    ws.print_area = f'A1:D{current-2}'
+    ws.print_area = f'A1:E{current-2}'
     output = folder/'Ведомость.xlsx'
     wb.save(output)
     (folder/'Ведомость.json').write_text(json.dumps(
@@ -258,14 +293,15 @@ def export(folder, rows, journal, assembly, marking):
 def preview(rows, title):
     lines = [title, '']
     for section in SECTIONS:
-        lines.extend([section.upper(), '№\tНаименование / материал\tДлина, мм\tКол-во'])
+        lines.extend([section.upper(), '№\tНаименование / материал\tДлина, мм\tПлощадь, м²\tКол-во'])
         for i,row in enumerate((r for r in rows if r['section']==section),1):
             label = re.sub(r'\s+',' ',row['label'])
-            short = label if len(label) <= 75 else label[:72]+'...'
+            short = label if len(label) <= 60 else label[:57]+'...'
             length = number(row['length']) if row['length'] is not None else ''
             qty = str(row['quantity']) if row['quantity'] is not None else ''
-            lines.append(f'{i}\t{short}\t{length}\t{qty}')
-            if len(label)>75:
+            area = number(row['area'],8) if row['area'] is not None else ''
+            lines.append(f'{i}\t{short}\t{length}\t{area}\t{qty}')
+            if len(label)>60:
                 lines.append('\t'+label)
         lines.append('')
     return '\n'.join(lines)

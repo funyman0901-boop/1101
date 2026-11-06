@@ -24,7 +24,7 @@ from win32com.shell import shell, shellcon
 
 import kompas_dimensions as core
 
-APP_NAME = "Габариты и ведомость изделия 1.4 — КОМПАС-3D v24"
+APP_NAME = "Габариты и ведомость изделия 1.5 — КОМПАС-3D v24"
 DATA = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "KompasDimensions"
 SCHEMA = DATA / "properties"
 UPDATE = C.WM_APP + 1
@@ -311,7 +311,7 @@ class SpecificationPreview:
         font.lfPitchAndFamily = C.FIXED_PITCH | C.FF_MODERN
         self.font = G.CreateFontIndirect(font)
         G.SendMessage(self.edit,C.WM_SETFONT,self.font,True)
-        tabstops = array.array('i',(24,350,420))
+        tabstops = array.array('i',(24,285,365,450))
         G.SendMessage(self.edit,C.EM_SETTABSTOPS,len(tabstops),tabstops.buffer_info()[0])
         G.SendMessage(self.edit,C.EM_SETLIMITTEXT,2000000,0)
         G.SetWindowText(self.edit,result['text'].replace('\n','\r\n'))

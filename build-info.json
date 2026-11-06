@@ -1,14 +1,14 @@
 {
-  "version": "1.4",
+  "version": "1.5",
   "platform": "Windows x64",
-  "input": "Recursive .m3d dimensions and material bill from a selected .a3d assembly",
+  "input": "Recursive .m3d dimensions and assembly bill with timber lengths and sheet areas",
   "target": "КОМПАС-3D v24",
   "build": "Python 3.11.9 / PyInstaller 6.16.0 / Wine",
   "verification": {
-    "logic_tests": 45,
+    "logic_tests": 49,
     "frozen_excel_export": true,
     "frozen_gui_launch": true,
     "kompas_integration_tested": false
   },
-  "exe_sha256": "eb8467a8aee48462e2c31019a63a8363f50fa4fd932c3d691ac6e3b7347e5c0a"
+  "exe_sha256": "a07023b2e7d46cf859b512fef66b4dd3e3cf0317efaa62c0c32825d5770acb7b"
 }
