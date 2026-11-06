@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Нативное окно Windows: рекурсивная обработка папок с деталями .m3d."""
 import contextlib
+import array
 import io
 import json
 import os
@@ -15,6 +16,7 @@ import pythoncom
 import win32api
 import win32con as C
 import win32gui as G
+import win32ui
 import win32com
 from win32com.client import gencache
 import win32com.gen_py
@@ -22,7 +24,7 @@ from win32com.shell import shell, shellcon
 
 import kompas_dimensions as core
 
-APP_NAME = "Габариты деталей 1.3 — обработка исполнений — КОМПАС-3D v24"
+APP_NAME = "Габариты и ведомость изделия 1.4 — КОМПАС-3D v24"
 DATA = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "KompasDimensions"
 SCHEMA = DATA / "properties"
 UPDATE = C.WM_APP + 1
@@ -54,6 +56,7 @@ class Window:
         self.busy = False
         self.events = queue.Queue()
         self.controls = {}
+        self.previews = []
         self.mode = "bbox"
         self.output = Path(shell.SHGetFolderPath(
             0, shellcon.CSIDL_PERSONAL, None, 0)) / "Габариты КОМПАС"
@@ -91,8 +94,8 @@ class Window:
         self.add("BUTTON", "Сформировать Excel", 20, 299, 220, 38, 101)
         self.add("BUTTON", "Записать свойства + Excel", 250, 299, 285, 38, 102)
         self.add("BUTTON", "Открыть отчёты", 545, 299, 210, 38, 103)
-        self.add("STATIC", "Стандартные и прочие изделия пропускаются. Размеры — числа в мм.",
-                 20, 355, 750, 24)
+        self.add("BUTTON", "Ведомость по сборке .a3d...", 20, 353, 400, 34, 105)
+        self.add("STATIC", "Сортамент, метизы, прочие изделия.", 435, 362, 330, 23)
         self.add("STATIC", "Журнал обработки:", 20, 389, 750, 23)
         self.log = self.add("EDIT", "Выберите папку с деталями.\r\n", 20, 417, 735, 230,
                              302, C.WS_BORDER | C.ES_MULTILINE | C.ES_READONLY |
@@ -166,10 +169,53 @@ class Window:
             return
         self.output = output
         self.busy = True
-        for ident in (101, 102, 104, 201, 202, 301, 303):
+        for ident in (101, 102, 104, 105, 201, 202, 301, 303):
             G.EnableWindow(self.controls[ident], False)
         self.append("\n" + ("Запись свойств и Excel" if write else "Только Excel") + "\n")
         threading.Thread(target=self.worker, args=(write, output, self.mode, input_folder), daemon=True).start()
+
+    def start_specification(self):
+        if self.busy:
+            return
+        output = Path(G.GetWindowText(self.path_edit).strip()).expanduser()
+        if not output.is_absolute():
+            G.MessageBox(self.hwnd, "Укажите полный путь к папке отчётов.", APP_NAME, C.MB_ICONWARNING)
+            return
+        dialog = win32ui.CreateFileDialog(True, 'a3d', None,
+            C.OFN_FILEMUSTEXIST | C.OFN_HIDEREADONLY,
+            'Сборки КОМПАС-3D (*.a3d)|*.a3d|Все файлы (*.*)|*.*||')
+        dialog.SetOFNTitle('Выберите сборку изделия для создания ведомости')
+        if dialog.DoModal() != C.IDOK:
+            return
+        assembly = Path(dialog.GetPathName())
+        if assembly.suffix.lower() != '.a3d':
+            G.MessageBox(self.hwnd, "Выберите файл сборки .a3d.", APP_NAME, C.MB_ICONWARNING)
+            return
+        self.output = output
+        self.busy = True
+        for ident in (101, 102, 104, 105, 201, 202, 301, 303):
+            G.EnableWindow(self.controls[ident], False)
+        self.append('\nВедомость материалов по выбранной сборке\n')
+        threading.Thread(target=self.worker_specification, args=(assembly,output,self.mode),daemon=True).start()
+
+    def worker_specification(self, assembly, output, mode):
+        pythoncom.CoInitialize()
+        try:
+            writer = LogWriter(lambda text:self.post('log',text))
+            with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+                prepare_cache()
+                import bill_of_materials
+                result = bill_of_materials.run(core.Kompas(),assembly,output,mode)
+                self.post('specification',result)
+                print('Ведомость готова.' if not result['errors'] else
+                      'Ведомость неполная: есть ошибки чтения. Смотрите журнал.')
+        except Exception as exc:
+            self.post('log','\nОШИБКА ВЕДОМОСТИ: '+str(exc)+'\n')
+            DATA.mkdir(parents=True,exist_ok=True)
+            (DATA/'last_error.txt').write_text(traceback.format_exc(),encoding='utf-8')
+        finally:
+            pythoncom.CoUninitialize()
+            self.post('done',None)
 
     def choose_folder(self):
         pythoncom.CoInitialize()
@@ -203,6 +249,8 @@ class Window:
                 self.start(ident == 102)
             elif ident == 104:
                 self.choose_folder()
+            elif ident == 105:
+                self.start_specification()
             elif ident == 103:
                 try:
                     self.output.mkdir(parents=True, exist_ok=True)
@@ -215,9 +263,11 @@ class Window:
                 kind, value = self.events.get_nowait()
                 if kind == "log":
                     self.append(value)
+                elif kind == 'specification':
+                    self.previews.append(SpecificationPreview(self.hwnd,value))
                 elif kind == "done":
                     self.busy = False
-                    for ident in (101, 102, 104, 201, 202, 301, 303):
+                    for ident in (101, 102, 104, 105, 201, 202, 301, 303):
                         G.EnableWindow(self.controls[ident], True)
             return 0
         if msg == C.WM_CLOSE:
@@ -232,9 +282,64 @@ class Window:
         return G.DefWindowProc(hwnd, msg, wp, lp)
 
 
+class SpecificationPreview:
+    def __init__(self, owner, result):
+        self.result = result
+        instance = win32api.GetModuleHandle(None)
+        wc = G.WNDCLASS()
+        wc.hInstance = instance
+        wc.lpszClassName = 'KompasSpecification_'+str(id(self))
+        wc.lpfnWndProc = self.proc
+        wc.hCursor = G.LoadCursor(0,C.IDC_ARROW)
+        wc.hbrBackground = C.COLOR_BTNFACE+1
+        G.RegisterClass(wc)
+        style = C.WS_OVERLAPPED|C.WS_CAPTION|C.WS_SYSMENU|C.WS_MINIMIZEBOX
+        self.hwnd = G.CreateWindow(wc.lpszClassName,'Ведомость изделия — просмотр',style,
+                                  C.CW_USEDEFAULT,C.CW_USEDEFAULT,1100,710,owner,0,instance,None)
+        G.CreateWindow('BUTTON','Открыть Excel',C.WS_CHILD|C.WS_VISIBLE|C.WS_TABSTOP,
+                       20,15,190,32,self.hwnd,1,instance,None)
+        G.CreateWindow('BUTTON','Открыть папку',C.WS_CHILD|C.WS_VISIBLE|C.WS_TABSTOP,
+                       225,15,190,32,self.hwnd,2,instance,None)
+        G.CreateWindow('STATIC','Сохранено на одном листе Excel. Данные без формул.',C.WS_CHILD|C.WS_VISIBLE,
+                       440,24,630,23,self.hwnd,0,instance,None)
+        self.edit = G.CreateWindow('EDIT','',C.WS_CHILD|C.WS_VISIBLE|C.WS_BORDER|C.ES_MULTILINE|
+                       C.ES_READONLY|C.WS_VSCROLL|C.WS_HSCROLL|C.ES_AUTOHSCROLL,
+                       20,65,1040,580,self.hwnd,3,instance,None)
+        font = G.LOGFONT()
+        font.lfFaceName = 'Consolas'
+        font.lfHeight = -14
+        font.lfPitchAndFamily = C.FIXED_PITCH | C.FF_MODERN
+        self.font = G.CreateFontIndirect(font)
+        G.SendMessage(self.edit,C.WM_SETFONT,self.font,True)
+        tabstops = array.array('i',(24,350,420))
+        G.SendMessage(self.edit,C.EM_SETTABSTOPS,len(tabstops),tabstops.buffer_info()[0])
+        G.SendMessage(self.edit,C.EM_SETLIMITTEXT,2000000,0)
+        G.SetWindowText(self.edit,result['text'].replace('\n','\r\n'))
+        G.ShowWindow(self.hwnd,C.SW_SHOW)
+        G.UpdateWindow(self.hwnd)
+
+    def proc(self, hwnd, msg, wp, lp):
+        if msg == C.WM_COMMAND and wp & 0xffff in (1,2):
+            try:
+                path = self.result['workbook']
+                os.startfile(path if wp & 0xffff == 1 else str(Path(path).parent))
+            except Exception as exc:
+                G.MessageBox(hwnd,str(exc),'Ведомость',C.MB_ICONERROR)
+            return 0
+        if msg == C.WM_CLOSE:
+            G.DestroyWindow(hwnd)
+            return 0
+        if msg == C.WM_DESTROY:
+            if hasattr(self,'font'):
+                G.DeleteObject(self.font)
+            return 0
+        return G.DefWindowProc(hwnd,msg,wp,lp)
+
+
 def self_test(folder):
     from openpyxl import load_workbook
     import embodiment_processing  # проверяет наличие модуля исполнений в .exe
+    import bill_of_materials
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     prepare_cache()
@@ -243,6 +348,12 @@ def self_test(folder):
     wb = load_workbook(folder / "dimensions.xlsx", data_only=False)
     assert wb.active["B2"].value == "=TEST"
     assert not any(c.data_type == 'f' for s in wb for row in s for c in row)
+    sample = bill_of_materials.aggregate([
+        {'material':'Труба 50х50х3','dimensions':(1000,50,50),'quantity':4},
+        {'material':'Лист сталь','dimensions':(500,300,4),'quantity':2}])
+    workbook,title = bill_of_materials.export(folder,sample,[],'Изделие.a3d','ABC.000')
+    assert len(load_workbook(workbook).sheetnames)==1
+    assert next(r for r in sample if r['length'] is not None)['length']==4000
     (folder / "self_test.json").write_text(json.dumps({"ok": True, "python": sys.version,
         "frozen": bool(getattr(sys, "frozen", False))}, ensure_ascii=False, indent=2), encoding="utf-8")
 
